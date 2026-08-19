@@ -201,6 +201,21 @@ end
 # default acceleration (see `mpi_owner_ainfo`), on the owning rank only.
 mpi_raw_aliasing(@nospecialize(x), dep_mod) = aliasing(x, dep_mod)
 
+# A `Chunk` reaching here still carries its `MPIRef` handle, but this runs under
+# the default acceleration, where `aliasing(::Chunk, dep_mod)` expects a plain
+# `DRef` (it reads the value through `unwrap`/`poolget` and inspects the handle
+# for swap-managed rebasing). Swap in the owner's local `DRef` -- non-`nothing`
+# precisely because this rank owns the ref -- so that path sees the local chunk
+# it expects. If it threw instead, the owner would die here, *before* sending
+# its half of the broadcast in `_aliasing_bcast`, leaving every non-owning rank
+# blocked forever on the matching recv.
+function mpi_raw_aliasing(x::Chunk, dep_mod)
+    handle = x.handle
+    handle isa MPIRef || return aliasing(x, dep_mod)
+    local_x = Chunk(x.chunktype, x.domain, handle.innerRef::DRef, x.processor, x.scope, x.space)
+    return aliasing(local_x, dep_mod)
+end
+
 """
     _aliasing_bcast(accel::MPIAcceleration, x, dep_mod)
 
