@@ -102,6 +102,21 @@ end
 Dagger.argument_move_may_inline(to_proc::ROCArrayDeviceProc, @nospecialize(value)) =
     value isa Dagger.Chunk && Dagger.processor(value) == to_proc
 
+# Best-effort, untested: `AMDGPU.Runtime.Mem.info()` returns `(free, total)`
+# bytes for the current device.
+function Dagger.local_memory_capacity(space::ROCVRAMMemorySpace)
+    @assert Dagger.root_worker_id(space) == myid()
+    return with_context(space) do
+        UInt64(last(AMDGPU.Runtime.Mem.info()))
+    end
+end
+function Dagger.local_memory_available(space::ROCVRAMMemorySpace)
+    @assert Dagger.root_worker_id(space) == myid()
+    return with_context(space) do
+        UInt64(first(AMDGPU.Runtime.Mem.info()))
+    end
+end
+
 function to_device(proc::ROCArrayDeviceProc)
     @assert Dagger.root_worker_id(proc) == myid()
     return DEVICES[proc.device_id]

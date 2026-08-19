@@ -107,6 +107,21 @@ end
 Dagger.argument_move_may_inline(to_proc::MtlArrayDeviceProc, @nospecialize(value)) =
     value isa Dagger.Chunk && Dagger.processor(value) == to_proc
 
+# Best-effort, untested: use the device's recommended working-set size as the
+# capacity and subtract the currently-allocated bytes for availability.
+function Dagger.local_memory_capacity(space::MetalVRAMMemorySpace)
+    @assert Dagger.root_worker_id(space) == myid()
+    dev = DEVICES[space.device_id]
+    return UInt64(dev.recommendedMaxWorkingSetSize)
+end
+function Dagger.local_memory_available(space::MetalVRAMMemorySpace)
+    @assert Dagger.root_worker_id(space) == myid()
+    dev = DEVICES[space.device_id]
+    cap = UInt64(dev.recommendedMaxWorkingSetSize)
+    used = UInt64(dev.currentAllocatedSize)
+    return used >= cap ? UInt64(0) : cap - used
+end
+
 function to_device(proc::MtlArrayDeviceProc)
     @assert Dagger.root_worker_id(proc) == myid()
     return DEVICES[proc.device_id]

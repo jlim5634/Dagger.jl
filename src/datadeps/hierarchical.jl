@@ -91,6 +91,18 @@
 #    keyed on (origin chunk identity, destination space) whose entries die with
 #    the origin chunk, plus an epilogue that does not free what it did not
 #    allocate this time round.
+# 6. The memory-aware tracker (`memory-aware.jl`) only runs on the sequential
+#    shared-state path (`schedule_partitions_sequential!`); enabling it forces
+#    that path (see `use_shared_state` in `distribute_tasks_hierarchical!`),
+#    giving up parallel per-partition planning for the region. Its budget
+#    bookkeeping (`live`/`resident`/`freed` `Dict`s) is not safe for concurrent
+#    mutation by multiple partition tasks, and its dead-slot reclaim compares
+#    a single `current_idx` against `last_use` indices computed by assuming
+#    one monotonic processing order -- a precondition `schedule_partition_full!`
+#    can't provide, since independent partitions advance through the vertex
+#    set concurrently and out of any shared order. Lifting this needs either a
+#    thread-safe tracker with per-space locking, or reclaim logic that no
+#    longer depends on a single global ordinal.
 
 struct HierarchicalTaskInfo
     arg_w::ArgumentWrapper
@@ -1299,6 +1311,11 @@ performed by `temp_queue`'s partition-local scheduler over `local_procs`.
 
 Callers must guarantee that every predecessor of `v` (in any partition) has
 already been submitted before calling this, so the `ThunkSyncdep`s are valid.
+
+`tracker`/`task_idx` forward to `distribute_task!` for the memory-aware
+adjustment layer (see `memory-aware.jl`). Only `schedule_partitions_sequential!`
+passes a non-`nothing` tracker -- see limitation 5 at the top of this file for
+why the parallel per-partition path (`schedule_partition_full!`) never does.
 """
 function _schedule_vertex!(v::Int, partition_id::Int,
                            temp_queue::DataDepsTaskQueue,
@@ -1310,7 +1327,9 @@ function _schedule_vertex!(v::Int, partition_id::Int,
                            vertex_to_partition::Vector{Int},
                            proc_to_scope_lfu,
                            write_num::Int,
-                           registry::Union{SharedChunkRegistry,Nothing})
+                           registry::Union{SharedChunkRegistry,Nothing};
+                           tracker::Union{DatadepsMemoryTracker,Nothing}=nothing,
+                           task_idx::Int=0)
     pair = seen_tasks[v]
     spec = pair.spec
     task = pair.task
@@ -1327,7 +1346,8 @@ function _schedule_vertex!(v::Int, partition_id::Int,
 
     return distribute_task!(temp_queue, state, local_procs, local_scope,
                             spec, task, spec.fargs,
-                            proc_to_scope_lfu, write_num; ownership=registry)
+                            proc_to_scope_lfu, write_num; ownership=registry,
+                            tracker, task_idx)
 end
 
 """
@@ -1476,6 +1496,15 @@ split-brain overlapping writes (e.g. whole-array + view + triangular dep_mods).
 
 Returns a one-element vector containing the shared state (for the hierarchical
 copy-from/free epilogue).
+
+When the memory-aware tracker (`memory-aware.jl`) is enabled, it is built here
+against topological order (not `seen_tasks` order): the tracker's dead-slot
+reclaim compares each task's `task_idx` against per-key `last_use` indices, and
+that comparison is only sound when `task_idx` advances in the same order tasks
+are actually planned. `seen_tasks` order need not match a valid topological
+order once tasks are partitioned, so `task_idx` here is a task's 1-based
+position in `topo`, and the tracker's own `last_use` pre-pass is run over
+`seen_tasks` reordered the same way.
 """
 function schedule_partitions_sequential!(queue::DataDepsTaskQueue,
                                          queue_lock::ReentrantLock,
@@ -1550,11 +1579,18 @@ function schedule_partitions_sequential!(queue::DataDepsTaskQueue,
         collect(vertices(dag))
     end
 
+    tracker = MEMORY_AWARE_CONFIG.enabled ?
+        build_memory_tracker(MEMORY_AWARE_CONFIG, DTaskPair[seen_tasks[v] for v in topo]) : nothing
+    if tracker !== nothing
+        shared_state.mem_tracker[] = tracker
+        tracker.active[] = true
+    end
+
     # Copy tasks spawned from within `distribute_task!` go through the same queue
     # as the tasks they serve, so that they are held (or not) alongside them.
     with_options(; task_queue=submit_queue) do
         try
-            for v in topo
+            for (task_idx, v) in enumerate(topo)
                 pid = vertex_to_partition[v]
                 local_procs = partition_procs[pid]
                 isempty(local_procs) && continue
@@ -1565,13 +1601,18 @@ function schedule_partitions_sequential!(queue::DataDepsTaskQueue,
                 write_num = _schedule_vertex!(
                     v, pid, temp_queues[pid], shared_state, local_procs,
                     local_scopes[pid], dag, seen_tasks, vertex_to_partition,
-                    proc_to_scope_lfus[pid], write_num, ownership)
+                    proc_to_scope_lfus[pid], write_num, ownership; tracker, task_idx)
             end
         finally
             maybe_flush_batch!(submit_queue)
             close_submitter!(submit_queue)
         end
     end
+
+    # Disable mid-region reclaim before the epilogue (write-back copies, final
+    # frees), matching flat `distribute_tasks!`: source slots for those copies
+    # must not be reclaimed out from under them.
+    tracker !== nothing && (tracker.active[] = false)
 
     return DataDepsState[shared_state]
 end
@@ -1747,8 +1788,14 @@ function _distribute_tasks_hierarchical!(queue::DataDepsTaskQueue,
     # space-keyed bookkeeping exact. It subsumes `multi_owner`, since procs on
     # different workers necessarily live in different `CPURAMMemorySpace`s.
     # See PERF(hier-2)/(hier-3).
+    #
+    # Also forced whenever the memory-aware tracker is enabled (see limitation 6
+    # at the top of this file): its budget bookkeeping isn't safe for concurrent
+    # mutation across partitions, and its reclaim logic needs the single
+    # monotonic processing order that only the sequential path provides.
     exec_spaces = unique(Iterators.flatten(memory_spaces(proc) for proc in all_procs))
-    use_shared_state = uniform_execution(accel) || length(exec_spaces) > 1
+    use_shared_state = uniform_execution(accel) || length(exec_spaces) > 1 ||
+        MEMORY_AWARE_CONFIG.enabled
     partition_states = @hier_phase schedule try
         if use_shared_state
             schedule_partitions_sequential!(
@@ -1791,8 +1838,13 @@ function _distribute_tasks_hierarchical!(queue::DataDepsTaskQueue,
     # Distributed keeps per-partition states and needs the registry for coherent
     # cross-partition write-back.
     epilogue_registry = use_shared_state ? nothing : registry
+    # `schedule_partitions_sequential!` stores the tracker (if any) on the
+    # shared state it returns as `partition_states[1]`, and already deactivated
+    # it (`active[] = false`) before returning so this epilogue's copies/frees
+    # are never mid-region-reclaimed.
+    tracker = use_shared_state ? partition_states[1].mem_tracker[] : nothing
     @hier_phase epilogue _hierarchical_copy_from_and_free!(
-        partition_states, length(partition_states), epilogue_registry)
+        partition_states, length(partition_states), epilogue_registry; tracker)
     report_hier_stats(length(seen_tasks), length(unique_arg_ws), n_partitions)
     return
 end
@@ -1857,7 +1909,8 @@ _hierarchical_chunk_sort_key(chunk::Chunk) = (short_name(chunk.space), hash(chun
 _hierarchical_chunk_sort_key(chunk) = ("", _identity_hash(chunk))
 
 function _hierarchical_copy_from_and_free!(partition_states::Vector{DataDepsState}, n_partitions::Int,
-                                           registry::Union{SharedChunkRegistry,Nothing})
+                                           registry::Union{SharedChunkRegistry,Nothing};
+                                           tracker::Union{DatadepsMemoryTracker,Nothing}=nothing)
     # 1. Shared chunks: DEAD -- `registry` is always `nothing` here (see the
     #    "Cross-partition chunk ownership" note above). Kept alongside the rest
     #    of that machinery.
@@ -1915,7 +1968,10 @@ function _hierarchical_copy_from_and_free!(partition_states::Vector{DataDepsStat
     # N.B. `freed` spans *all* partitions, not just one: a buffer reachable from
     # several ainfos, or recorded in more than one partition's object cache, must
     # be freed exactly once. A double `unsafe_free!` is harmless on CPU (refcount
-    # decrement) but releases device memory twice on GPU backends.
+    # decrement) but releases device memory twice on GPU backends. Seeded from
+    # the memory-aware tracker's own `freed` set (when active), matching flat
+    # `distribute_tasks!`, so buffers it already reclaimed mid-region are not
+    # freed again here.
     #
     # N.B. The per-partition syncdep derivation below is exact only while a
     # buffer is reachable from the single partition whose cache allocated it,
@@ -1923,7 +1979,7 @@ function _hierarchical_copy_from_and_free!(partition_states::Vector{DataDepsStat
     # slot hand-off) is currently dead code. See the constraint recorded with
     # `SharedChunkRegistry` above before re-enabling parallel planning across
     # memory spaces.
-    freed = IdDict{Any,Nothing}()
+    freed = tracker !== nothing ? tracker.freed : IdDict{Any,Nothing}()
     for pid in 1:n_partitions
         state = partition_states[pid]
         obj_cache = unwrap(state.ainfo_backing_chunk)
