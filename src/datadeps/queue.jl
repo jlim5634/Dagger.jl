@@ -324,8 +324,16 @@ function emit_slot_free!(state::DataDepsState, space::MemorySpace, key_ainfo, re
     free_proc = first(processors(space))
     free_scope = ExactScope(free_proc)
     free_syncdeps = Set{ThunkSyncdep}()
-    obj_cache = unwrap(state.ainfo_backing_chunk)
-    buf_ainfo = stored_value_ainfo(obj_cache, space, key_ainfo)
+    # `key_ainfo === nothing` for tracker-resident slots (the disk-spill path
+    # keys `resident` by slot key, not by ainfo), and `stored_value_ainfo` takes
+    # an `AbstractAliasing`. Resolve the buffer's own destination-space aliasing
+    # only when we actually have a key; `gather_free_syncdeps!` already handles a
+    # `nothing` ainfo (it only consults it on the MPI non-inspectable fallback).
+    buf_ainfo = if key_ainfo === nothing
+        nothing
+    else
+        stored_value_ainfo(unwrap(state.ainfo_backing_chunk), space, key_ainfo)
+    end
     gather_free_syncdeps!(state, space, buf_ainfo, remote_arg, write_num, chunk_to_ainfos, free_syncdeps)
     # Capture the slot in the task closure rather than passing it as a dependency
     # argument: as an argument Dagger would `move` it (for a `ChunkView` this
