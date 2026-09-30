@@ -165,7 +165,7 @@ It is an error to spill a pinned ref; callers must `poolunpin` first.
 function datadeps_spill!(dev::DatadepsDevice, state::MemPool.RefState, ref_id::Int)
     sstate = MemPool.storage_read(state)
     sstate.data === nothing && return false
-    if MemPool.ispinned(state)
+    if ref_ispinned(state)
         throw(ConcurrencyViolationError("Cannot spill pinned DRef $ref_id; call `poolunpin` first"))
     end
     arr = something(sstate.data)
@@ -222,7 +222,7 @@ function datadeps_free!(ref::DRef)
         return remotecall_fetch(datadeps_free!, ref.owner, ref)
     end
     state = MemPool.with_lock(()->MemPool.datastore[ref.id], MemPool.datastore_lock)
-    MemPool.ispinned(state) && MemPool.poolunpin(ref)
+    ref_ispinned(state) && MemPool.poolunpin(ref)
     sstate = MemPool.storage_read(state)
     dev = sstate.root
     data = sstate.data

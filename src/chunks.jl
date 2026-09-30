@@ -113,3 +113,23 @@ else
 poolpin(c::Chunk; remote::Bool=true) = nothing
 poolunpin(c::Chunk; remote::Bool=true) = nothing
 end
+
+"""
+    ref_ispinned(state::MemPool.RefState) -> Bool
+
+Whether a ref is currently pinned, `false` on a MemPool without pinning support.
+
+Companion to the `poolpin`/`poolunpin` fallbacks above, and guarded separately
+because `MemPool.ispinned` is consulted on paths that run regardless of whether
+anything was ever pinned (`datadeps_spill!`'s safety check and
+`datadeps_free!`'s unpin-if-pinned). Calling it unguarded made those paths throw
+`UndefVarError` against every released MemPool -- and since the free runs in a
+spawned task, the failure surfaced as a lost free rather than an error.
+Without native pinning `poolpin` is a no-op, so nothing is ever pinned and
+`false` is the correct answer.
+"""
+@static if isdefined(MemPool, :ispinned)
+    ref_ispinned(state) = MemPool.ispinned(state)
+else
+    ref_ispinned(@nospecialize(state)) = false
+end
