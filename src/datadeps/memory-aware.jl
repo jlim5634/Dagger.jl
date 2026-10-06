@@ -514,6 +514,37 @@ function _evict_resident!(tracker::DatadepsMemoryTracker, state::DataDepsState,
         end
     end
 
+    # Freeing in place destroys the data, so it needs proof that nothing will
+    # read this slot again -- and the wait above does not provide it.
+    # `istaskstarted` is `isdefined(t, :thunk_ref)`, i.e. *launched*, so the loop
+    # drains every launched reader but silently passes over an unlaunched one.
+    # Datadeps registers a reader when it *plans* the task, which can precede
+    # submission, so such a reader goes on to read the buffer we just freed.
+    #
+    # The candidate looked safe for the same reason: Phase 1 selects on
+    # `last_use[key] < current_idx`, which is the *planning* index, while the
+    # buffer is read on the execution timeline that planning runs ahead of.
+    #
+    # Observed as sums computed from freed memory -- garbage, or a neighbouring
+    # tile's values once the allocator reused the block -- and as a worker
+    # segfault at tile sizes large enough for `free` to unmap the pages.
+    #
+    # Spilling carries no such requirement (the data survives on disk behind the
+    # same `DRef`, so a late reader's `poolget` reloads it), so leaving the slot
+    # to the spill phase is both correct and what the caller wants: a copy that
+    # is still going to be read belongs on disk, not destroyed.
+    if !to_disk
+        for a in ainfos
+            owner = get(state.ainfos_owner, a, nothing)
+            if owner !== nothing && !istaskdone(owner[1])
+                return UInt64(0)
+            end
+            for reader in get(state.ainfos_readers, a, ())
+                istaskdone(reader[1]) || return UInt64(0)
+            end
+        end
+    end
+
     dirty = key in tracker.written
     if to_disk
         # Release the lifecycle pin, then swap the buffer to disk via MemPool.
